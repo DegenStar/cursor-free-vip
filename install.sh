@@ -436,14 +436,15 @@ install_dependencies() {
                 PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
             fi
 
-            # Only install xclip on systems with a display server
-            if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
-                if ! command -v xclip &>/dev/null && ! command -v wl-copy &>/dev/null; then
-                    if [ -n "$WAYLAND_DISPLAY" ]; then
-                        PACKAGES_TO_INSTALL+=("wl-clipboard")
-                    else
-                        PACKAGES_TO_INSTALL+=("$(resolve_pkg_name xclip "$PKG_MANAGER")")
-                    fi
+            # Install clipboard tools: xclip for X11/W_SL, wl-clipboard for Wayland
+            # Prefer xclip in WSL or X11 environments, wl-clipboard for native Wayland
+            if ! command -v xclip &>/dev/null && ! command -v wl-copy &>/dev/null; then
+                if [ -n "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; then
+                    # Pure Wayland environment
+                    PACKAGES_TO_INSTALL+=("wl-clipboard")
+                else
+                    # X11, WSL, or unknown display type - default to xclip
+                    PACKAGES_TO_INSTALL+=("$(resolve_pkg_name xclip "$PKG_MANAGER")")
                 fi
             fi
 
