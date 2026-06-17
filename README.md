@@ -27,12 +27,13 @@
 <div align="center">
   <img src="error.png" alt="client" width="500" style="border-radius: 8px; margin-top: 10px;"/>
 </div>
+
 请先打开"文件-首选项-Cursor Settings"中点击 **log out** 退出账户，然后执行以下操作。
 
 ---
 
-### 快速安装
-自动识别系统环境/自动安装缺失的依赖/下载并安装主程序/立即运行主程序
+### 📦 快速安装
+**自动识别系统环境/自动安装缺失的依赖/下载并安装主程序/立即运行主程序**
 
 <details open>
 <summary><b>Linux / WSL / MacOS 系统</b></summary>（必须已安装 git，如未安装请参考➡️<a href="./安装git教程.md">安装git教程</a>）
