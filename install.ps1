@@ -1,3 +1,48 @@
+# set color theme
+$Theme = @{
+    Primary   = 'Cyan'
+    Success   = 'Green'
+    Warning   = 'Yellow'
+    Error     = 'Red'
+    Info      = 'White'
+}
+
+# ASCII Logo
+$Logo = @"
+   ██████╗██╗   ██╗██████╗ ███████╗ ██████╗ ██████╗      ██████╗ ██████╗  ██████╗   
+  ██╔════╝██║   ██║██╔══██╗██╔════╝██╔═══██╗██╔══██╗     ██╔══██╗██╔══██╗██╔═══██╗  
+  ██║     ██║   ██║██████╔╝███████╗██║   ██║██████╔╝     ██████╔╝██████╔╝██║   ██║  
+  ██║     ██║   ██║██╔══██╗╚════██║██║   ██║██╔══██╗     ██╔═══╝ ██╔══██╗██║   ██║  
+  ╚██████╗╚██████╔╝██║  ██║███████║╚██████╔╝██║  ██║     ██║     ██║  ██║╚██████╔╝  
+   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝     ╚═╝     ╚═╝  ╚═╝ ╚═════╝  
+"@
+
+# Beautiful Output Function
+function Write-Styled {
+    param (
+        [string]$Message,
+        [string]$Color = $Theme.Info,
+        [string]$Prefix = "",
+        [switch]$NoNewline
+    )
+    $symbol = switch ($Color) {
+        $Theme.Success { "[OK]" }
+        $Theme.Error   { "[X]" }
+        $Theme.Warning { "[!]" }
+        default        { "[*]" }
+    }
+    
+    $output = if ($Prefix) { "$symbol $Prefix :: $Message" } else { "$symbol $Message" }
+    if ($NoNewline) {
+        Write-Host $output -ForegroundColor $Color -NoNewline
+    } else {
+        Write-Host $output -ForegroundColor $Color
+    }
+}
+
+# Show Logo
+Write-Host $Logo -ForegroundColor $Theme.Primary
+
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Please run this script as Administrator.' -ForegroundColor Red
     exit 1
@@ -716,6 +761,106 @@ function Install-UvToolPackage {
     Add-FailedStep -Step "Install tool $displayName" -Reason 'command-not-found'
 }
 
+function Get-TargetVersion {
+    if ($env:CURSOR_VIP_VERSION) { return $env:CURSOR_VIP_VERSION }
+    return '0.48.3'
+}
+
+function Install-CursorFreeVIP {
+    param(
+        [string]$PythonPath
+    )
+
+    if (-not $PythonPath) {
+        Write-WarnLog 'Skipping main program installation because Python is unavailable.'
+        Add-FailedStep -Step 'Install and download main program' -Reason 'python-missing'
+        return
+    }
+
+    $version = Get-TargetVersion
+    $installDir = Join-Path $env:USERPROFILE '.cursor-vip-src'
+    $zipName = "cursor-free-vip-${version}.zip"
+    $zipPath = Join-Path $env:TEMP $zipName
+    $downloadUrl = "https://github.com/hovanhoa/cursor-free-vip/archive/refs/tags/v${version}.zip"
+
+    if (-not (Test-Path $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+
+    $existingDir = Get-ChildItem -Path $installDir -Directory -Filter 'cursor-free-vip*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($existingDir -and (Test-Path (Join-Path $existingDir.FullName 'main.py'))) {
+        Write-InfoLog "Detected installed source directory: $($existingDir.FullName)"
+        $reqPath = Join-Path $existingDir.FullName 'requirements.txt'
+        if (Test-Path $reqPath) {
+            Write-StepLog 'Installing project dependencies (requirements.txt)'
+            try {
+                & $PythonPath -m pip install -r $reqPath --upgrade
+            } catch {
+                Write-ContinueOnError -Step 'Install requirements.txt' -Action 'install requirements' -ErrorRecord $_
+            }
+        }
+        Write-StepLog 'Launching main program'
+        try {
+            & $PythonPath (Join-Path $existingDir.FullName 'main.py')
+        } catch {
+            Write-ContinueOnError -Step 'Launch main program' -Action 'launch main.py' -ErrorRecord $_
+        }
+        return
+    }
+
+    Write-StepLog "Downloading main program source (v${version})"
+    Write-InfoLog "Download URL: $downloadUrl"
+    try {
+        Enable-ModernTls
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-ContinueOnError -Step 'Download main program' -Action 'download source zip' -ErrorRecord $_
+        return
+    }
+
+    if (-not (Test-Path $zipPath)) {
+        Write-WarnLog "Source zip not found after download: $zipPath"
+        Add-FailedStep -Step 'Download main program' -Reason 'file-missing'
+        return
+    }
+
+    Write-StepLog 'Extracting source package'
+    try {
+        Expand-Archive -Path $zipPath -DestinationPath $installDir -Force -ErrorAction Stop
+    } catch {
+        Write-ContinueOnError -Step 'Extract main program' -Action 'extract zip' -ErrorRecord $_
+        return
+    }
+
+    $actualDir = Get-ChildItem -Path $installDir -Directory -Filter 'cursor-free-vip*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $actualDir) {
+        Write-WarnLog 'Could not find extracted directory after unzip'
+        Add-FailedStep -Step 'Install main program' -Reason 'extract-dir-missing'
+        return
+    }
+
+    $reqPath = Join-Path $actualDir.FullName 'requirements.txt'
+    if (Test-Path $reqPath) {
+        Write-StepLog 'Installing project dependencies (requirements.txt)'
+        try {
+            & $PythonPath -m pip install -r $reqPath --upgrade
+        } catch {
+            Write-ContinueOnError -Step 'Install requirements.txt' -Action 'install requirements' -ErrorRecord $_
+        }
+    } else {
+        Write-WarnLog "requirements.txt not found, skipping: $($actualDir.FullName)"
+    }
+
+    Write-StepLog 'Launching main program'
+    try {
+        & $PythonPath (Join-Path $actualDir.FullName 'main.py')
+    } catch {
+        Write-ContinueOnError -Step 'Launch main program' -Action 'launch main.py' -ErrorRecord $_
+    }
+
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+}
+
 try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
@@ -779,6 +924,9 @@ try {
     } else {
         Write-WarnLog 'Configuration directory not found, skipping environment configuration: .configs'
     }
+
+    # Install and download main program
+    Install-CursorFreeVIP -PythonPath $pythonPath
 
     Write-InfoLog 'Installation bootstrap completed.'
 } finally {

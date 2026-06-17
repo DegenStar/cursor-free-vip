@@ -1,5 +1,26 @@
 #!/bin/bash
 
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # 无色
+
+# Logo
+print_logo() {
+    echo -e "${CYAN}"
+    cat << "EOF"
+    ██████╗██╗    ██╗██████╗ ███████╗ ██████╗ ██████╗      ██████╗ ██████╗  ██████╗   
+   ██╔════╝██║    ██║██╔══██╗██╔════╝██╔═══██╗██╔══██╗     ██╔══██╗██╔══██╗██╔═══██╗  
+   ██║     ██║    ██║██████╔╝███████╗██║    ██║██████╔╝     ██████╔╝██████╔╝██║    ██║  
+   ██║     ██║    ██║██╔══██╗╚════██║██║    ██║██╔══██╗     ██╔═══╝ ██╔══██╗██║    ██║  
+   ╚██████╗╚██████╔╝██║   ██║███████║╚██████╔╝██║   ██║     ██║     ██║   ██║╚██████╔╝  
+    ╚═════╝ ╚═════╝ ╚═╝   ╚═╝╚══════╝ ╚═════╝ ╚═╝   ╚═╝     ╚═╝     ╚═╝   ╚═╝ ╚═════╝  
+EOF
+    echo -e "${NC}"
+}
+
 FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
@@ -614,6 +635,105 @@ if [ ! -d .configs ]; then
 else
     run_step "配置相关环境" run_remote_config_script
 fi
+
+get_target_version() {
+    echo "${CURSOR_VIP_VERSION:-0.48.3}"
+}
+
+get_install_root() {
+    echo "$HOME/.cursor-vip-src"
+}
+
+run_cursor_main() {
+    local main_py="$1"
+    local py_cmd="${PYTHON_CMD:-python3}"
+
+    if [ ! -f "$main_py" ]; then
+        echo "WARN: main.py 不存在，无法启动：$main_py" >&2
+        return 1
+    fi
+
+    chmod +x "$main_py" 2>/dev/null || true
+    echo "即将启动主程序：$main_py"
+    if [ "$EUID" -ne 0 ]; then
+        sudo "$py_cmd" "$main_py"
+    else
+        "$py_cmd" "$main_py"
+    fi
+}
+
+install_and_download_main_program() {
+    local version=""
+    local install_dir=""
+    local zip_name=""
+    local zip_path=""
+    local download_url=""
+    local existing_dir=""
+    local actual_dir=""
+    local requirements_path=""
+
+    if [ -z "$PYTHON_CMD" ]; then
+        echo "WARN: 未找到 Python，跳过主程序安装与启动" >&2
+        FAILED_STEPS+=("安装和下载主程序 (python-missing)")
+        return 0
+    fi
+
+    version="$(get_target_version)"
+    install_dir="$(get_install_root)"
+    zip_name="cursor-free-vip-${version}.zip"
+    zip_path="/tmp/${zip_name}"
+    download_url="https://github.com/hovanhoa/cursor-free-vip/archive/refs/tags/v${version}.zip"
+
+    mkdir -p "$install_dir"
+
+    existing_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
+    if [ -n "$existing_dir" ] && [ -f "$existing_dir/main.py" ]; then
+        echo "检测到已安装源码目录：$existing_dir"
+        requirements_path="$existing_dir/requirements.txt"
+        if [ -f "$requirements_path" ]; then
+            run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
+        fi
+        run_step "启动主程序" run_cursor_main "$existing_dir/main.py"
+        return 0
+    fi
+
+    echo "正在下载主程序源码包（v${version}）..."
+    echo "下载地址：$download_url"
+    if command -v curl &>/dev/null; then
+        run_step "下载主程序源码包" curl -fL -o "$zip_path" "$download_url"
+    elif command -v wget &>/dev/null; then
+        run_step "下载主程序源码包" wget -O "$zip_path" "$download_url"
+    else
+        echo "WARN: 未找到 curl/wget，无法下载主程序源码包" >&2
+        FAILED_STEPS+=("下载主程序源码包 (downloader-missing)")
+        return 0
+    fi
+
+    if [ ! -f "$zip_path" ]; then
+        echo "WARN: 源码包下载失败或文件不存在：$zip_path" >&2
+        FAILED_STEPS+=("下载主程序源码包 (file-missing)")
+        return 0
+    fi
+
+    run_step "解压主程序源码包" unzip -o "$zip_path" -d "$install_dir"
+    actual_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
+    if [ -z "$actual_dir" ]; then
+        echo "WARN: 解压后未找到主程序目录" >&2
+        FAILED_STEPS+=("安装和下载主程序 (extract-dir-missing)")
+        return 0
+    fi
+
+    requirements_path="$actual_dir/requirements.txt"
+    if [ -f "$requirements_path" ]; then
+        run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
+    else
+        echo "WARN: 未找到 requirements.txt，跳过项目依赖安装：$actual_dir" >&2
+    fi
+
+    run_step "启动主程序" run_cursor_main "$actual_dir/main.py"
+}
+
+run_step "安装和下载主程序" install_and_download_main_program
 
 echo "安装完成！"
 print_path_refresh_hint
