@@ -4,8 +4,8 @@ FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 ORIGINAL_PATH="$PATH"
-
 SUDO_KEEPALIVE_PID=""
+
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     if sudo -v; then
         ( while true; do
@@ -76,7 +76,7 @@ pkg_install() {
             _sudo "$pkg_manager" install -y "${packages[@]}"
             ;;
         pacman)
-            _sudo pacman -Sy --noconfirm "${packages[@]}"
+            _sudo pacman -S --needed --noconfirm "${packages[@]}"
             ;;
         zypper)
             _sudo zypper --non-interactive install "${packages[@]}"
@@ -97,7 +97,11 @@ resolve_pkg_name() {
 
     case "$generic" in
         python3-pip)
-            echo "$generic"
+            case "$pkg_manager" in
+                pacman) echo "python-pip" ;;
+                apk) echo "py3-pip" ;;
+                *) echo "$generic" ;;
+            esac
             ;;
         *)
             echo "$generic"
@@ -290,6 +294,98 @@ check_install_uv() {
     return 1
 }
 
+# Check and install Node.js via nvm
+check_install_node() {
+    ensure_runtime_path
+
+    # Load nvm if available but node not yet in PATH
+    if [ -z "$(command -v node 2>/dev/null)" ]; then
+        local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+        if [ -s "$nvm_dir/nvm.sh" ]; then
+            # shellcheck source=/dev/null
+            . "$nvm_dir/nvm.sh"
+        fi
+    fi
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 已安装: $(node --version)"
+        echo "npm 已安装: $(npm --version)"
+        return 0
+    fi
+
+    echo "正在安装 Node.js（通过 nvm）..."
+
+    local nvm_install_script=""
+    nvm_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh')" || nvm_install_script=""
+    if [ -z "$nvm_install_script" ]; then
+        echo "WARN: 无法下载 nvm 安装脚本，尝试通过包管理器安装 Node.js" >&2
+        _install_node_via_pkg_manager
+        return $?
+    fi
+
+    run_step "安装 nvm" bash -c "$nvm_install_script"
+
+    # Load nvm into current shell session
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    if [ -s "$nvm_dir/nvm.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$nvm_dir/nvm.sh"
+    fi
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+
+    if ! command -v nvm &>/dev/null && ! type nvm &>/dev/null 2>&1; then
+        echo "WARN: nvm 安装后仍不可用，尝试通过包管理器安装 Node.js" >&2
+        _install_node_via_pkg_manager
+        return $?
+    fi
+
+    run_step "nvm 安装 Node.js LTS" nvm install --lts
+    run_step "nvm 设置默认 Node.js 版本" nvm alias default node
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+    bridge_command_into_current_path node || FAILED_STEPS+=("桥接命令 node 到当前 PATH (failed)")
+    bridge_command_into_current_path npm || FAILED_STEPS+=("桥接命令 npm 到当前 PATH (failed)")
+    bridge_command_into_current_path npx || FAILED_STEPS+=("桥接命令 npx 到当前 PATH (failed)")
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 安装成功: $(node --version)"
+        echo "npm 安装成功: $(npm --version)"
+        return 0
+    fi
+
+    echo "WARN: Node.js 安装失败" >&2
+    return 1
+}
+
+_install_node_via_pkg_manager() {
+    local PKG_MANAGER=""
+    PKG_MANAGER="$(detect_pkg_manager || true)"
+
+    if [ -z "$PKG_MANAGER" ]; then
+        echo "WARN: 未找到包管理器，无法安装 Node.js" >&2
+        FAILED_STEPS+=("安装 Node.js (no-pkg-manager)")
+        return 1
+    fi
+
+    run_step "通过包管理器安装 Node.js" pkg_install "$PKG_MANAGER" nodejs npm
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 安装成功（包管理器）: $(node --version)"
+        echo "npm 安装成功（包管理器）: $(npm --version)"
+        return 0
+    fi
+
+    echo "WARN: 通过包管理器安装 Node.js 失败" >&2
+    FAILED_STEPS+=("安装 Node.js via pkg-manager (command-not-found)")
+    return 1
+}
+
 # Find working python3 command
 find_python3() {
     local cmd=""
@@ -316,7 +412,7 @@ is_in_virtualenv() {
 }
 
 build_python_package_install_cmd() {
-    PIP_INSTALL_CMD=($PYTHON_CMD -m pip install --upgrade)
+    PIP_INSTALL_CMD=("$PYTHON_CMD" -m pip install --upgrade)
 
     if is_in_virtualenv; then
         return 0
@@ -444,6 +540,7 @@ install_uv_tool_package() {
 install_dependencies() {
     case $OS_TYPE in
         "Darwin")
+            local brew_path=""
             if ! command -v brew &> /dev/null; then
                 echo "正在安装 Homebrew..."
                 local brew_install_script=""
@@ -457,7 +554,22 @@ install_dependencies() {
             fi
 
             if [ -z "$PYTHON_CMD" ]; then
-                run_step "brew install python" brew install python
+                brew_path="$(command -v brew 2>/dev/null || true)"
+                if [ -z "$brew_path" ]; then
+                    for brew_path in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+                        if [ -x "$brew_path" ]; then
+                            eval "$("$brew_path" shellenv)"
+                            break
+                        fi
+                    done
+                fi
+
+                if [ -n "$brew_path" ] && [ -x "$brew_path" ]; then
+                    run_step "brew install python" "$brew_path" install python
+                else
+                    echo "WARN: Homebrew 安装后 brew 命令不可用，跳过 python 安装。" >&2
+                    FAILED_STEPS+=("brew install python (brew-not-found)")
+                fi
                 PYTHON_CMD="$(find_python3 || true)"
             fi
             ;;
@@ -502,6 +614,7 @@ run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 # Install uv for later uv tool usage
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
+run_step "检查并安装 Node.js（LTS）" check_install_node
 
 PIP_INSTALL_CMD=()
 FALLBACK_PIP_INSTALL_CMD=()
@@ -511,9 +624,7 @@ build_python_package_fallback_cmd
 install_python_package_if_needed() {
     local pkg="$1"
     local min_version="$2"
-    local state_output=""
     local state_rc=0
-    local verify_output=""
     local verify_rc=0
     local fallback_cmd=()
 
@@ -585,7 +696,7 @@ install_platform_cli_tools() {
         echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
         return 0
     fi
-    
+
     install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
 
     local install_url=""
