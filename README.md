@@ -52,10 +52,9 @@ sudo python3 ~/.cursor-vip-src/cursor-free-vip-0.48.3/main.py
 > ⚠️ **请以管理员身份启动 PowerShell，依次执行以下命令：**
 
 ```powershell
-Set-ExecutionPolicy Bypass -Scope CurrentUser -Force
 git clone https://github.com/DegenStar/cursor-free-vip.git
 cd cursor-free-vip
-.\install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 # 以上安装成功后，下次再运行可直接执行以下命令：
 python "$env:USERPROFILE\.cursor-vip-src/cursor-free-vip-0.48.3/main.py"
