@@ -1,6 +1,55 @@
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host 'Please run this script as Administrator.' -ForegroundColor Red
+param(
+    [string]$RelaunchWorkingDirectory,
+    [string]$ExpectedUserSid
+)
+
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUserSid = if ($currentIdentity.User) { $currentIdentity.User.Value } else { $null }
+if (-not $currentUserSid) {
+    Write-Host '[ERROR] Unable to determine the user running this script.' -ForegroundColor Red
     exit 1
+}
+
+if (-not ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Always bind elevation to the user who launched the non-elevated script.
+    $ExpectedUserSid = $currentUserSid
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+
+    $quote = { param($v) '"' + ($v -replace '"', '\"') + '"' }
+
+    $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
+    $relaunchArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', (& $quote $scriptPath),
+        '-RelaunchWorkingDirectory', (& $quote $workDir),
+        '-ExpectedUserSid', (& $quote $ExpectedUserSid)
+    )
+    foreach ($a in $args) {
+        if ($null -ne $a) { $relaunchArgs += (& $quote $a) }
+    }
+
+    try {
+        $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
+            -Verb RunAs -Wait -PassThru
+        $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+        exit $code
+    } catch {
+        Write-Host '[ERROR] Administrator privileges are required; elevation was cancelled or blocked.' -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($ExpectedUserSid -and $ExpectedUserSid -ne $currentUserSid) {
+    Write-Host '[ERROR] UAC elevation must use the same user that started this script.' -ForegroundColor Red
+    exit 1
+}
+
+if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
+    Set-Location -LiteralPath $RelaunchWorkingDirectory
 }
 
 $originalPSDefaults = if ($PSDefaultParameterValues -and $PSDefaultParameterValues.Count -gt 0) {
@@ -80,8 +129,6 @@ function Write-ContinueOnError {
     Add-FailedStep -Step $Step -Reason $message
 }
 
-# GitHub raw/gist endpoints can fail on older Windows PowerShell defaults unless
-# TLS 1.2+ is enabled explicitly for the current process.
 function Enable-ModernTls {
     try {
         $protocol = [System.Net.ServicePointManager]::SecurityProtocol
@@ -298,8 +345,6 @@ function Test-StoreStub {
     return $false
 }
 
-# Return the first matching executable from a list of candidate command names,
-# skipping Windows Store stubs.
 function Get-CommandPath {
     param(
         [string[]]$Names
@@ -431,8 +476,6 @@ function Install-Uv {
     return $null
 }
 
-# Given a command path that might be py.exe or a Store stub, resolve the real
-# python.exe via sys.executable and verify it works.
 function Resolve-PythonPath {
     param(
         [string]$Candidate
@@ -466,8 +509,6 @@ function Resolve-PythonPath {
     return $Candidate
 }
 
-# Scrape the latest 64-bit Python installer URL and fall back to a pinned build
-# if the download pages cannot be parsed.
 function Get-PythonInstallerArch {
     $arch = $env:PROCESSOR_ARCHITECTURE
     if ($arch -eq 'ARM64') {
@@ -477,6 +518,15 @@ function Get-PythonInstallerArch {
         return 'win32'
     }
     return 'amd64'
+}
+
+function Get-PreferredPythonInstallerUrl {
+    $installerArch = Get-PythonInstallerArch
+    if ($installerArch -eq 'amd64') {
+        return 'https://www.python.org/ftp/python/3.12.2/python-3.12.2-amd64.exe'
+    }
+
+    return $null
 }
 
 function Get-LatestPythonInstallerUrl {
@@ -549,31 +599,44 @@ function Install-Python {
     }
 
     $installerPath = Join-Path $env:TEMP 'python-installer.exe'
-    $pythonUrl = Get-LatestPythonInstallerUrl
-    Write-InfoLog "Python was not found. Downloading installer from: $pythonUrl"
+    $installerUrls = New-Object System.Collections.Generic.List[string]
+    $preferredPythonUrl = Get-PreferredPythonInstallerUrl
 
-    try {
-        Enable-ModernTls
-        Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
-        $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
-        if ($process.ExitCode -eq 0) {
-            Update-ProcessPath
-            foreach ($name in @('python', 'py')) {
-                $candidate = Get-CommandPath -Names @($name)
-                $resolved = Resolve-PythonPath $candidate
-                if ($resolved) {
-                    Write-InfoLog "Python installation completed: $resolved"
-                    return $resolved
+    if ($preferredPythonUrl) {
+        [void]$installerUrls.Add($preferredPythonUrl)
+    }
+
+    $fallbackPythonUrl = Get-LatestPythonInstallerUrl
+    if ($fallbackPythonUrl -and -not $installerUrls.Contains($fallbackPythonUrl)) {
+        [void]$installerUrls.Add($fallbackPythonUrl)
+    }
+
+    foreach ($pythonUrl in $installerUrls) {
+        Write-InfoLog "Python was not found. Downloading installer from: $pythonUrl"
+
+        try {
+            Enable-ModernTls
+            Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
+            $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
+            if ($process.ExitCode -eq 0) {
+                Update-ProcessPath
+                foreach ($name in @('python', 'py')) {
+                    $candidate = Get-CommandPath -Names @($name)
+                    $resolved = Resolve-PythonPath $candidate
+                    if ($resolved) {
+                        Write-InfoLog "Python installation completed: $resolved"
+                        return $resolved
+                    }
                 }
             }
-        }
 
-        Write-WarnLog "Python installer finished with exit code $($process.ExitCode), but Python is still unavailable."
-        Add-FailedStep -Step 'Install Python' -Reason "exit=$($process.ExitCode)"
-    } catch {
-        Write-ContinueOnError -Step 'Install Python' -Action 'install Python' -ErrorRecord $_
-    } finally {
-        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+            Write-WarnLog "Python installer finished with exit code $($process.ExitCode), but Python is still unavailable."
+            Add-FailedStep -Step 'Install Python' -Reason "exit=$($process.ExitCode)"
+        } catch {
+            Write-ContinueOnError -Step 'Install Python' -Action 'install Python' -ErrorRecord $_
+        } finally {
+            Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+        }
     }
 
     return $null
@@ -638,8 +701,19 @@ function Install-PythonPackage {
     }
 }
 
+function Invoke-UvToolInstall {
+    param(
+        [string]$UvPath,
+        [string[]]$Arguments
+    )
 
-# Install a CLI tool via uv tool
+    & $UvPath @Arguments 2>&1 | ForEach-Object {
+        $_.ToString() -replace '\s+\(from git\+https?://[^)]+\)$', ''
+    }
+
+    $script:LastUvToolExitCode = $LASTEXITCODE
+}
+
 function Install-UvToolPackage {
     param(
         [string]$UvPath,
@@ -660,22 +734,24 @@ function Install-UvToolPackage {
     try {
         if ($existingCommand) {
             try {
-                & $UvPath tool install --upgrade $PackageSpec
-                $upgradeExitCode = $LASTEXITCODE
+                Invoke-UvToolInstall -UvPath $UvPath -Arguments @('tool', 'install', '--upgrade', $PackageSpec)
+                $upgradeExitCode = $script:LastUvToolExitCode
                 if ($upgradeExitCode -ne 0) {
                     Add-FailedStep -Step "Upgrade tool $displayName" -Reason "exit=$upgradeExitCode"
-                    & $UvPath tool install --force $PackageSpec
-                    if ($LASTEXITCODE -ne 0) {
-                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
+                    Invoke-UvToolInstall -UvPath $UvPath -Arguments @('tool', 'install', '--force', $PackageSpec)
+                    $installExitCode = $script:LastUvToolExitCode
+                    if ($installExitCode -ne 0) {
+                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$installExitCode"
                         return
                     }
                 }
             } catch {
                 Write-ContinueOnError -Step "Upgrade tool $displayName" -Action "upgrade CLI tool $displayName" -ErrorRecord $_
                 try {
-                    & $UvPath tool install --force $PackageSpec
-                    if ($LASTEXITCODE -ne 0) {
-                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
+                    Invoke-UvToolInstall -UvPath $UvPath -Arguments @('tool', 'install', '--force', $PackageSpec)
+                    $installExitCode = $script:LastUvToolExitCode
+                    if ($installExitCode -ne 0) {
+                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$installExitCode"
                         return
                     }
                 } catch {
@@ -686,9 +762,10 @@ function Install-UvToolPackage {
         } else {
             Write-StepLog "Installing CLI tool via uv tool: $displayName"
 
-            & $UvPath tool install $PackageSpec
-            if ($LASTEXITCODE -ne 0) {
-                Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
+            Invoke-UvToolInstall -UvPath $UvPath -Arguments @('tool', 'install', $PackageSpec)
+            $installExitCode = $script:LastUvToolExitCode
+            if ($installExitCode -ne 0) {
+                Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$installExitCode"
                 return
             }
         }
@@ -716,106 +793,6 @@ function Install-UvToolPackage {
     Add-FailedStep -Step "Install tool $displayName" -Reason 'command-not-found'
 }
 
-function Get-TargetVersion {
-    if ($env:CURSOR_VIP_VERSION) { return $env:CURSOR_VIP_VERSION }
-    return '0.48.3'
-}
-
-function Install-CursorFreeVIP {
-    param(
-        [string]$PythonPath
-    )
-
-    if (-not $PythonPath) {
-        Write-WarnLog 'Skipping main program installation because Python is unavailable.'
-        Add-FailedStep -Step 'Install and download main program' -Reason 'python-missing'
-        return
-    }
-
-    $version = Get-TargetVersion
-    $installDir = Join-Path $env:USERPROFILE '.cursor-vip-src'
-    $zipName = "cursor-free-vip-${version}.zip"
-    $zipPath = Join-Path $env:TEMP $zipName
-    $downloadUrl = "https://github.com/hovanhoa/cursor-free-vip/archive/refs/tags/v${version}.zip"
-
-    if (-not (Test-Path $installDir)) {
-        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    }
-
-    $existingDir = Get-ChildItem -Path $installDir -Directory -Filter 'cursor-free-vip*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($existingDir -and (Test-Path (Join-Path $existingDir.FullName 'main.py'))) {
-        Write-InfoLog "Detected installed source directory: $($existingDir.FullName)"
-        $reqPath = Join-Path $existingDir.FullName 'requirements.txt'
-        if (Test-Path $reqPath) {
-            Write-StepLog 'Installing project dependencies (requirements.txt)'
-            try {
-                & $PythonPath -m pip install -r $reqPath --upgrade
-            } catch {
-                Write-ContinueOnError -Step 'Install requirements.txt' -Action 'install requirements' -ErrorRecord $_
-            }
-        }
-        Write-StepLog 'Launching main program'
-        try {
-            & $PythonPath (Join-Path $existingDir.FullName 'main.py')
-        } catch {
-            Write-ContinueOnError -Step 'Launch main program' -Action 'launch main.py' -ErrorRecord $_
-        }
-        return
-    }
-
-    Write-StepLog "Downloading main program source (v${version})"
-    Write-InfoLog "Download URL: $downloadUrl"
-    try {
-        Enable-ModernTls
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Write-ContinueOnError -Step 'Download main program' -Action 'download source zip' -ErrorRecord $_
-        return
-    }
-
-    if (-not (Test-Path $zipPath)) {
-        Write-WarnLog "Source zip not found after download: $zipPath"
-        Add-FailedStep -Step 'Download main program' -Reason 'file-missing'
-        return
-    }
-
-    Write-StepLog 'Extracting source package'
-    try {
-        Expand-Archive -Path $zipPath -DestinationPath $installDir -Force -ErrorAction Stop
-    } catch {
-        Write-ContinueOnError -Step 'Extract main program' -Action 'extract zip' -ErrorRecord $_
-        return
-    }
-
-    $actualDir = Get-ChildItem -Path $installDir -Directory -Filter 'cursor-free-vip*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $actualDir) {
-        Write-WarnLog 'Could not find extracted directory after unzip'
-        Add-FailedStep -Step 'Install main program' -Reason 'extract-dir-missing'
-        return
-    }
-
-    $reqPath = Join-Path $actualDir.FullName 'requirements.txt'
-    if (Test-Path $reqPath) {
-        Write-StepLog 'Installing project dependencies (requirements.txt)'
-        try {
-            & $PythonPath -m pip install -r $reqPath --upgrade
-        } catch {
-            Write-ContinueOnError -Step 'Install requirements.txt' -Action 'install requirements' -ErrorRecord $_
-        }
-    } else {
-        Write-WarnLog "requirements.txt not found, skipping: $($actualDir.FullName)"
-    }
-
-    Write-StepLog 'Launching main program'
-    try {
-        & $PythonPath (Join-Path $actualDir.FullName 'main.py')
-    } catch {
-        Write-ContinueOnError -Step 'Launch main program' -Action 'launch main.py' -ErrorRecord $_
-    }
-
-    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-}
-
 try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
@@ -827,8 +804,7 @@ try {
         @{ Name = 'pyperclip'; Version = '1.8.2' },
         @{ Name = 'cryptography'; Version = '42.0.0' },
         @{ Name = 'pywin32'; Version = '306' },
-        @{ Name = 'pycryptodome'; Version = '3.19.0' },
-        @{ Name = 'python-dotenv'; Version = '1.0.0' }
+        @{ Name = 'pycryptodome'; Version = '3.19.0' }
     )
 
     foreach ($pkg in $requirements) {
@@ -917,9 +893,6 @@ try {
     } catch {
         Write-ContinueOnError -Step 'Run setup script' -Action 'run setup script' -ErrorRecord $_
     }
-
-    # Install and download main program
-    Install-CursorFreeVIP -PythonPath $pythonPath
 
     Write-InfoLog 'Installation bootstrap completed.'
 } finally {
