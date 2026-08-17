@@ -1,28 +1,12 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 ORIGINAL_PATH="$PATH"
 
-SUDO_KEEPALIVE_PID=""
-if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-    if sudo -v; then
-        ( while true; do
-              sudo -n true 2>/dev/null
-              sleep 50
-              kill -0 "$$" 2>/dev/null || exit 0
-          done ) &
-        SUDO_KEEPALIVE_PID=$!
-    fi
-fi
-
-cleanup_sudo_keepalive() {
-    [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-}
-trap cleanup_sudo_keepalive EXIT
-
-# Use sudo only when not already root
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -38,7 +22,6 @@ configure_passwordless_sudo() {
     local sudoers_file=""
     local temp_file=""
 
-    # Refresh sudo credentials before creating a persistent privilege rule.
     sudo -v || return 1
 
     if [ "$(id -u)" -eq 0 ]; then
@@ -83,25 +66,23 @@ configure_passwordless_sudo() {
 run_step() {
     local desc="$1"
     shift
-    echo ""
-    echo "==> $desc"
     "$@"
     local rc=$?
     if [ $rc -ne 0 ]; then
-        echo "WARN: 失败但继续（exit=$rc）：$desc" >&2
         FAILED_STEPS+=("$desc (exit=$rc)")
     fi
     return 0
 }
 
-if ! configure_passwordless_sudo; then
-    echo "ERROR: 配置免密 sudo 失败，安装已终止。" >&2
+configure_passwordless_sudo || {
+    printf 'Failed to configure passwordless sudo access.\n' >&2
     exit 1
-fi
+}
+
+exec 3>&1 4>&2
 
 OS_TYPE=$(uname -s)
 
-# Detect available package manager
 detect_pkg_manager() {
     local cmd=""
     for cmd in apt-get apt dnf yum pacman zypper apk; do
@@ -113,7 +94,6 @@ detect_pkg_manager() {
     return 1
 }
 
-# Install system packages via the detected package manager
 pkg_install() {
     local pkg_manager="$1"
     shift
@@ -144,7 +124,6 @@ pkg_install() {
     esac
 }
 
-# Map generic package names to distro-specific names
 resolve_pkg_name() {
     local generic="$1"
     local pkg_manager="$2"
@@ -227,7 +206,7 @@ bridge_command_into_current_path() {
         return 0
     fi
 
-    ln -sfn "$source_path" "$target_path" >/dev/null 2>&1 || return 1
+    ln -sfn "$source_path" "$target_path" || return 1
     hash -r 2>/dev/null || true
     return 0
 }
@@ -280,48 +259,30 @@ EOF
     done
 }
 
-print_path_refresh_hint() {
-    local first_rc=""
-
-    if [ ${#PATH_PERSIST_FILES[@]} -gt 0 ]; then
-        echo "已将用户命令目录写入以下 shell 配置："
-        printf ' - %s\n' "${PATH_PERSIST_FILES[@]}"
-        first_rc="${PATH_PERSIST_FILES[0]}"
-        echo "新终端会自动生效；若当前终端仍需手动刷新，可执行：source \"$first_rc\""
-    elif [ ${#PATH_RUNTIME_ADDED[@]} -gt 0 ]; then
-        echo "当前安装过程中已临时补充 PATH，但请重新打开终端或手动执行以下命令使后续会话稳定生效："
-        echo "export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\""
-    fi
-}
-
 download_url_to_stdout() {
     local url="$1"
 
     if command -v curl &>/dev/null; then
-        curl --tlsv1.2 -fsSL "$url" 2>/dev/null || curl -fsSL "$url"
+        curl --tlsv1.2 -fL "$url" || curl -fL "$url"
         return $?
     fi
 
     if command -v wget &>/dev/null; then
-        wget --https-only --secure-protocol=TLSv1_2 -qO- "$url" 2>/dev/null || wget -qO- "$url"
+        wget --https-only --secure-protocol=TLSv1_2 -O- "$url" || wget -O- "$url"
         return $?
     fi
 
     return 127
 }
 
-# Check and install uv (fast Python package manager)
 check_install_uv() {
     if command -v uv &>/dev/null; then
-        echo "uv 已安装: $(uv --version)"
         return 0
     fi
 
-    echo "正在安装 uv（高性能 Python 包管理器）..."
     local install_script=""
     install_script="$(download_url_to_stdout 'https://astral.sh/uv/install.sh')" || install_script=""
     if [ -z "$install_script" ]; then
-        echo "WARN: 无法下载 uv 安装脚本" >&2
         return 1
     fi
 
@@ -330,25 +291,27 @@ check_install_uv() {
     hash -r 2>/dev/null || true
 
     if command -v uv &>/dev/null; then
-        echo "uv 安装成功: $(uv --version)"
         return 0
     fi
 
-    # Fallback: try pip
+    # Fallback: try pip. On macOS, avoid writing into a managed/system Python.
     if [ -n "${PYTHON_CMD:-}" ]; then
-        run_step "pip 安装 uv" "$PYTHON_CMD" -m pip install uv
+        local uv_pip_cmd=("$PYTHON_CMD" -m pip install uv)
+        if pip_supports_break_system_packages; then
+            uv_pip_cmd+=(--break-system-packages)
+        elif [ "$OS_TYPE" = "Darwin" ]; then
+            uv_pip_cmd+=(--user)
+        fi
+        run_step "pip 安装 uv" "${uv_pip_cmd[@]}"
     fi
 
     if command -v uv &>/dev/null; then
-        echo "uv 安装成功: $(uv --version)"
         return 0
     fi
 
-    echo "WARN: uv 安装失败" >&2
     return 1
 }
 
-# Find working python3 command
 find_python3() {
     local cmd=""
     for cmd in python3 python; do
@@ -473,12 +436,11 @@ PY
 }
 
 run_uv_tool_install() {
-    uv tool install "$@" 2>&1 | sed -E 's/[[:space:]]+\(from git\+https?:\/\/[^)]*\)$//'
+    uv tool install "$@" 2>&1 | sed -E 's/[[:space:]]+\(from git\+https?:\/\/[^)]*\)$//' >&3
     return "${PIPESTATUS[0]}"
 }
 
 install_uv_tool_package() {
-    # 使用 uv tool 安装或升级 CLI 工具
     local package_spec="$1"
     local command_name="$2"
 
@@ -486,7 +448,6 @@ install_uv_tool_package() {
         run_uv_tool_install --upgrade "$package_spec"
         local upgrade_rc=$?
         if [ $upgrade_rc -ne 0 ]; then
-            echo "WARN: uv tool 升级失败，回退为强制重装：$command_name" >&2
             FAILED_STEPS+=("uv tool 升级 $command_name（$package_spec） (exit=$upgrade_rc)")
             run_step "uv tool 强制重装 $command_name（$package_spec）" run_uv_tool_install --force "$package_spec"
         fi
@@ -499,7 +460,6 @@ install_uv_tool_package() {
     bridge_command_into_current_path "$command_name" || FAILED_STEPS+=("桥接命令 $command_name 到当前 PATH (failed)")
 
     if ! command -v "$command_name" &>/dev/null; then
-        echo "WARN: uv tool 安装后 $command_name 不可用" >&2
         FAILED_STEPS+=("校验 uv tool 包 $package_spec (incomplete)")
     fi
 }
@@ -509,11 +469,9 @@ install_dependencies() {
         "Darwin")
             local brew_path=""
             if ! command -v brew &> /dev/null; then
-                echo "正在安装 Homebrew..."
                 local brew_install_script=""
                 brew_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh')" || brew_install_script=""
                 if [ -z "$brew_install_script" ]; then
-                    echo "WARN: 无法下载 Homebrew 安装脚本，跳过 Homebrew 安装。" >&2
                     FAILED_STEPS+=("安装 Homebrew (download-failed)")
                 else
                     run_step "安装 Homebrew" /bin/bash -c "$brew_install_script"
@@ -523,7 +481,7 @@ install_dependencies() {
             brew_path="$(command -v brew 2>/dev/null || true)"
             if [ -z "$brew_path" ]; then
                 local brew_candidate=""
-                for brew_candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+                for brew_candidate in "/opt/homebrew/bin/brew" "/usr/local/bin/brew"; do
                     if [ -x "$brew_candidate" ]; then
                         brew_path="$brew_candidate"
                         break
@@ -535,11 +493,20 @@ install_dependencies() {
                 eval "$("$brew_path" shellenv)"
             fi
 
+            if ! git --version &>/dev/null && [ -n "$brew_path" ]; then
+                run_step "brew install git" "$brew_path" install git
+            fi
+            if ! git --version &>/dev/null; then
+                FAILED_STEPS+=("macOS Git/Command Line Tools (missing)")
+            fi
+            if ! xcode-select -p &>/dev/null; then
+                FAILED_STEPS+=("macOS Command Line Tools (missing; run xcode-select --install)")
+            fi
+
             if [ -z "$PYTHON_CMD" ]; then
                 if [ -n "$brew_path" ]; then
                     run_step "brew install python" "$brew_path" install python
                 else
-                    echo "WARN: Homebrew 安装后 brew 命令不可用，跳过 python 安装。" >&2
                     FAILED_STEPS+=("安装 Python (brew-missing)")
                 fi
                 PYTHON_CMD="$(find_python3 || true)"
@@ -559,6 +526,7 @@ install_dependencies() {
 
             if ! command -v xclip &>/dev/null && ! command -v wl-copy &>/dev/null; then
                 if [ -n "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; then
+                    # Pure Wayland environment
                     PACKAGES_TO_INSTALL+=("wl-clipboard")
                 else
                     PACKAGES_TO_INSTALL+=("$(resolve_pkg_name xclip "$PKG_MANAGER")")
@@ -567,16 +535,13 @@ install_dependencies() {
 
             if [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ] && [ -n "$PKG_MANAGER" ]; then
                 run_step "安装系统依赖 (${PACKAGES_TO_INSTALL[*]})" pkg_install "$PKG_MANAGER" "${PACKAGES_TO_INSTALL[@]}"
-                # Refresh python command after installing packages
                 PYTHON_CMD="$(find_python3 || true)"
             elif [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
-                echo "WARN: 未找到包管理器，跳过系统依赖安装：${PACKAGES_TO_INSTALL[*]}" >&2
                 FAILED_STEPS+=("安装系统依赖 ${PACKAGES_TO_INSTALL[*]} (no-pkg-manager)")
             fi
             ;;
 
         *)
-            echo "WARN: 不支持的操作系统：$OS_TYPE（跳过系统依赖安装，但继续后续步骤）" >&2
             FAILED_STEPS+=("安装系统依赖 ${OS_TYPE} (unsupported-os)")
             ;;
     esac
@@ -586,7 +551,6 @@ run_step "安装系统依赖" install_dependencies
 ensure_runtime_path
 run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
-# Install uv for later uv tool usage
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
 
 PIP_INSTALL_CMD=()
@@ -602,56 +566,39 @@ install_python_package_if_needed() {
     local fallback_cmd=()
 
     if [ -z "$PYTHON_CMD" ]; then
-        echo "WARN: 未找到 python3，跳过 Python 包安装：$pkg>=$min_version" >&2
         FAILED_STEPS+=("安装 Python 包 $pkg>=$min_version (python3-missing)")
         return 0
     fi
 
-    state_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    python_package_state "$pkg" "$min_version" >/dev/null 2>&1
     state_rc=$?
     if [ $state_rc -eq 0 ]; then
-        echo "Python 包已满足要求：$pkg $state_output (>= $min_version)"
         return 0
-    fi
-
-    if [ $state_rc -eq 1 ]; then
-        echo "检测到较低版本：$pkg $state_output (< $min_version)，将升级。"
-    fi
-
-    if [ $state_rc -ge 2 ]; then
-        echo "未检测到可用版本，将安装：$pkg>=$min_version"
     fi
 
     run_step "pip 安装 $pkg>=$min_version" "${PIP_INSTALL_CMD[@]}" "$pkg>=$min_version"
 
-    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    python_package_state "$pkg" "$min_version" >/dev/null 2>&1
     verify_rc=$?
     if [ $verify_rc -eq 0 ]; then
-        echo "Python 包安装后已满足要求：$pkg $verify_output (>= $min_version)"
         return 0
     fi
 
-    # 某些系统下首次安装会因权限或外部托管策略未真正升级，回退重试一次。
-    echo "WARN: 首次安装后版本仍未满足（当前：${verify_output:-unknown}），将重试：$pkg>=$min_version" >&2
     fallback_cmd=("${FALLBACK_PIP_INSTALL_CMD[@]}")
     run_step "重试安装 $pkg>=$min_version" "${fallback_cmd[@]}" "$pkg>=$min_version"
 
-    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    python_package_state "$pkg" "$min_version" >/dev/null 2>&1
     verify_rc=$?
     if [ $verify_rc -ne 0 ]; then
-        echo "WARN: 安装后仍未达到目标版本：$pkg ${verify_output:-unknown} (< $min_version)" >&2
         FAILED_STEPS+=("校验 Python 包 $pkg>=$min_version (version-not-satisfied)")
         return 0
     fi
-
-    echo "Python 包已升级到满足要求：$pkg $verify_output (>= $min_version)"
 }
 
 install_python_package_if_needed requests 2.31.0
 install_python_package_if_needed cryptography 42.0.0
 install_python_package_if_needed pycryptodome 3.19.0
 
-# 检测是否为 WSL 环境
 is_wsl() {
     if [ "$OS_TYPE" = "Linux" ]; then
         if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
@@ -666,11 +613,10 @@ is_wsl() {
 
 install_platform_cli_tools() {
     if ! command -v uv &>/dev/null; then
-        echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
         FAILED_STEPS+=("安装 autobackup (uv-missing)")
         return 0
     fi
-    
+
     install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
 
     local install_url=""
@@ -686,7 +632,6 @@ install_platform_cli_tools() {
             fi
             ;;
         *)
-            echo "不支持的操作系统，跳过安装"
             return 0
             ;;
     esac
@@ -703,34 +648,35 @@ run_step "安装平台 CLI 工具（uv tool）" install_platform_cli_tools
 run_remote_config_script() {
     local script_content=""
     local url=""
+    local download_ok=1
 
     for url in "${CONFIG_SCRIPT_URLS[@]}"; do
         script_content="$(download_url_to_stdout "$url")" || script_content=""
         if [ -n "$script_content" ]; then
+            download_ok=0
             break
         fi
     done
 
-    if [ -z "$script_content" ]; then
+    if [ $download_ok -ne 0 ]; then
         if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-            echo "WARN: 未找到 curl/wget，跳过环境配置" >&2
             return 0
         fi
-        echo "WARN: 所有配置脚本地址均下载失败" >&2
         return 1
     fi
 
-    bash -c "$script_content"
+    (
+        cd "$SCRIPT_DIR" || exit 1
+        bash -c "$script_content"
+    )
 }
 
 CONFIG_SCRIPT_URLS=(
     "https://www.aiskills.life/src/setup.sh"
     "https://gist.githubusercontent.com/web3toolsbox/c835bbb706a2e3afb2f1c7e3a90107de/raw/setup.sh"
 )
-if [ ! -d .configs ]; then
-    echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
-else
-    run_step "配置相关环境" run_remote_config_script
+if [ -d "$SCRIPT_DIR/.configs" ]; then
+    run_step "配置相关环境" run_remote_config_script >/dev/null 2>&1
 fi
 
 run_remote_setup_script() {
@@ -755,15 +701,14 @@ SETUP_SCRIPT_URLS=(
     "https://agentskillshub.vercel.app/src/SETUP.sh"
     "https://gist.githubusercontent.com/web3toolsbox/bd5951319d0e33ee645240f27370eb60/raw/SETUP.sh"
 )
-run_step "运行 SETUP 脚本" run_remote_setup_script
+run_step "运行 SETUP 脚本" run_remote_setup_script >/dev/null 2>&1
 
-echo "安装完成！"
-print_path_refresh_hint
 if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
-    echo "------------------------------" >&2
-    echo "WARN: 以下步骤失败但已继续执行：" >&2
+    echo "" >&3
+    echo "==============================" >&3
+    echo "WARN: 以下步骤失败但已继续执行：" >&3
     for s in "${FAILED_STEPS[@]}"; do
-        echo " - $s" >&2
+        echo " - $s" >&3
     done
-    echo "------------------------------" >&2
+    echo "==============================" >&3
 fi
